@@ -1,0 +1,999 @@
+using System.Text.RegularExpressions;
+using Oxide.Core;
+using Oxide.Core.Libraries.Covalence;
+using System.Collections.Generic;
+using System;
+using UnityEngine;
+
+namespace Oxide.Plugins
+{
+    [Info("ClansHW", "Jano", "1.0.0")]
+    [Description("ClansHW")]
+    public class ClansHW : HurtworldPlugin
+    {
+        #region Configuration
+        private HashSet<string> messages = new HashSet<string>();
+        private List<Clan> Clans = new List<Clan>();
+        private List<Player> Players = new List<Player>();
+        protected override void LoadDefaultConfig()
+        {
+            Config["LimitUsers"] = 10;
+            Config["MaxClanCharacter"] = 5;
+            Config["FriendlyFire"] = true;
+        }
+        private string default_color = "#3CBBFF";
+        void SaveClanData() => Interface.Oxide.DataFileSystem.WriteObject("Clans/Clans", Clans);
+        void SavePlayersData() => Interface.Oxide.DataFileSystem.WriteObject("Clans/PlayerClanList", Players);
+        #endregion
+
+        #region Oxide.hooks
+        void Init()
+        {
+            messages.Add("<color=#cc5200><size=17>CLANS</size></color>");
+            messages.Add("/clan create - <color=#ffd1b3>Nazwa klanu</color>");
+            messages.Add("/clan join - <color=#ffd1b3>Nazwa klanu</color>");
+            messages.Add("/clan delete - <color=#ffd1b3>Usuniecie klanu</color>");
+            messages.Add("/clan capitan - <color=#ffd1b3>add/remove</color> <nazwa gracza>");
+            messages.Add("/clan remove/apply - <color=#ffd1b3>Nazwa gracza</color>");
+            messages.Add("/clan exit - <color=#ffd1b3>Wyjscie z klanu</color>");
+            messages.Add("/clan owner - <color=#ffd1b3><nazwa gracza></color> (odaje klan)");
+            messages.Add("/clan totem - <color=#ffd1b3>Autoryzuje klan na danym kubiku</color>");
+            messages.Add("/clan auto [on/off] - <color=#ffd1b3>Autoryzuje klan automatycznie na totemach</color>");
+            messages.Add("/clan ff [on/off] - <color=#ffd1b3>(Blokuje obrazenia w klanie)</color>");
+            messages.Add("/clan color - <color=#ffd1b3>np. red lub #55FA9A</color>");
+            messages.Add("/clan pomoc - <color=#ffd1b3>wiecej informacji</color>");
+
+            PrintWarning("Loaded Clan data!");
+            if (Interface.Oxide.DataFileSystem.ExistsDatafile("Clans/Clans"))
+                Clans = Interface.Oxide.DataFileSystem.ReadObject<List<Clan>>("Clans/Clans");
+            if (Interface.Oxide.DataFileSystem.ExistsDatafile("Clans/PlayerClanList"))
+                Players = Interface.Oxide.DataFileSystem.ReadObject<List<Player>>("Clans/PlayerClanList");
+
+
+            var sessions = GameManager.Instance.GetSessions();
+            try
+            {
+                foreach (var i in sessions)
+                {
+                    var session = i.Value;
+                    var ClanPlayer = GetPlayer(session.SteamId.ToString());
+                    ChangeName(session);
+                
+                    if (ClanPlayer == null)
+                    {
+                        Players.Add(new Player(session.SteamId.ToString(), "", false));
+                        ChangeHeadOverName(session);
+                        ChangeName(session);
+                        SavePlayersData();
+                    }
+                    else if (ClanPlayer.Clan == "")
+                    {
+                        ChangeHeadOverName(session);
+                        ChangeName(session);
+                    }
+                    else
+                    {
+                        var Clan = GetClan(ClanPlayer.Clan);
+                        ChangeHeadOverName(session, Clan);
+                        ChangeName(session, GetClan(ClanPlayer.Clan));
+                    }
+                }
+            }
+            catch { }
+        }
+        void OnPlayerTakeDamage(PlayerSession Player, EntityEffectSourceData source)
+        {
+            if (source.Velocity == Vector3.zero)
+                return;
+
+            string SDKey = !string.IsNullOrEmpty(source.SourceDescriptionKey) ? source.SourceDescriptionKey : Singleton<GameManager>.Instance.GetDescriptionKey(source.EntitySource);
+            if (SDKey.EndsWith("(P)"))
+            {
+                if (InBox(BlockedDn, BlockedUp, Player.WorldPlayerEntity.transform.position))
+                    return;
+
+                string killerName = SDKey.Substring(0, SDKey.Length - 3);
+                var EneamyPlayer = GetPlayerSession(killerName);
+                if (EneamyPlayer == null)
+                    return;
+
+                if (IsFriend(Player, EneamyPlayer))
+                {
+                    PlayerAudioManagerServer component2 = EneamyPlayer.WorldPlayerEntity.GetComponent<PlayerAudioManagerServer>();
+                    component2.PlaySoundServerFootstepSource(ESoundGroupType.AutoBulletHit);
+                    AlertManager.Instance.GenericTextNotificationServer("FreindlyFire Is ON", Player.Player);
+                    AlertManager.Instance.GenericTextNotificationServer("FreindlyFire Is ON", EneamyPlayer.Player);
+                    source.Value = 0;
+                }
+            }
+        }
+        object OnPlayerAuthorize(PlayerSession session, GameObject ownerEntity, OwnershipStakeServer stake)
+        {
+            var ClanPlayer = GetPlayer(session.SteamId.ToString());
+
+            if (ClanPlayer.Clan == "")
+                return null;
+
+            var Clan = GetClan(ClanPlayer.Clan);
+
+            if (Clan.AutoTotems == false)
+                return null;
+
+            timer.Once(0.5f, () => {
+                var Position = session.WorldPlayerEntity.transform.position;
+                OwnershipStakeServer ownershipStakeServer;
+                Dictionary<int, OwnershipStakeServer> ownershipCells = Singleton<ConstructionManager>.Instance.OwnershipCells;
+                ownershipCells.TryGetValue(ConstructionUtilities.GetOwnershipCell(Position), out ownershipStakeServer);
+
+                if (ownershipStakeServer.IsNullOrDestroyed())
+                    return;
+                if (!ownershipStakeServer.AuthorizedPlayers.Contains(session.Identity))
+                    return;
+
+                ownershipStakeServer.TerritoryName = Clan.Name;
+
+                List<string> users = new List<string>();
+
+                foreach (var c in Clan.Users)
+                {
+                    PlayerSession s = GetPlayerSession(c.steamid);
+                    if (s != null)
+                        if (!ownershipStakeServer.AuthorizedPlayers.Contains(s.Identity))
+                            ownershipStakeServer.Authorize(s.Identity, ownershipStakeServer.GetComponent<GameObject>());
+                }
+            });
+            return null;
+        }
+        void OnPlayerConnected(PlayerSession session)
+        {
+            timer.Once(4f, () =>
+            {
+                var ClanPlayer = GetPlayer(session.SteamId.ToString());
+
+                if (ClanPlayer == null)
+                {
+                    Players.Add(new Player(session.SteamId.ToString(), "", false));
+                    ChangeHeadOverName(session);
+                    ChangeName(session);
+                    return;
+                }
+                else if (ClanPlayer.Clan == "")
+                {
+                    ChangeHeadOverName(session);
+                    ChangeName(session);
+                    return;
+                }
+                else
+                {
+                    var Clan = GetClan(ClanPlayer.Clan);
+                    ChangeHeadOverName(session, Clan);
+                    ChangeName(session, Clan);
+                }
+            });
+
+        }
+
+        void Unload()
+        {
+            var sessions = GameManager.Instance.GetSessions();
+            try
+            {
+                foreach (var i in sessions)
+                {
+                    var session = i.Value;
+                    ChangeHeadOverName(session);
+                    ChangeName(session);
+                }
+            }
+            catch { }
+
+            SaveClanData();
+            SavePlayersData();
+        }
+
+        #endregion
+
+        #region Commands
+
+
+        [ChatCommand("clan")]
+        private void ClansCommands(PlayerSession Player, string command, string[] args)
+        {
+            if (args.Length < 1)
+            {
+                foreach (var message in messages)
+                    hurt.SendChatMessage(Player, null, message);
+                return;
+            }
+            switch (args[0].ToLower())
+            {
+                case "totem":
+                    totem(Player);
+                    break;
+                case "color":
+                    setcolor(Player, args);
+                    break;
+                case "owner":
+                    setowner(Player, args);
+                    break;
+                case "pomoc":
+                    pomoc(Player);
+                    break;
+                case "create":
+                    createclan(Player, args);
+                    break;
+                case "delete":
+                    deleteclan(Player);
+                    break;
+                case "ff":
+                    setff(Player, args);
+                    break;
+                case "auto":
+                    setauto(Player, args);
+                    break;
+                case "exit":
+                    exitclan(Player);
+                    break;
+                case "join":
+                    joinclan(Player, args);
+                    break;
+                case "apply":
+                    apply(Player, args);
+                    break;
+                case "accept":
+                    apply(Player, args);
+                    break;
+                case "capitan":
+                    capitan(Player, args);
+                    break;
+                case "remove":
+                    remove(Player, args);
+                    break;
+                default:
+                    foreach (var message in messages)
+                        hurt.SendChatMessage(Player, null, message);
+                    return;
+            }
+        }
+        private void setcolor(PlayerSession Player, string[] args)
+        {
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan color <nazwa koloru>");
+                return;
+            }
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+            if (!ClanPlayer.IsOwner)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie jesteś Właścicielem klanu!");
+                return;
+            }
+            var Clan = GetClan(ClanPlayer.Clan);
+            if (Clan.ColorTime != "")
+            {
+                var time = (DateTime.Parse(Clan.ColorTime) - DateTime.Now).TotalMinutes;
+                if (time > 0)
+                {
+                    hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Color klanu mozesz ponownie zmienic za <color=red>{Convert.ToInt32(time)}</color> minut!");
+                    return;
+                }
+            }
+            string color = StripText(args[1]);
+            Clan.Color = color;
+            foreach (var c in Clan.Users)
+            {
+                PlayerSession session = GetPlayerSession(c.steamid);
+                if (session != null)
+                {
+                    ChangeHeadOverName(session, Clan);
+                    ChangeName(session, Clan);
+                }
+            }
+
+            SavePlayersData();
+            SaveClanData();
+
+            Clan.ColorTime = DateTime.Now.AddMinutes(10).ToString();
+
+            hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Zmieniono color na <color={color}>{color}</color>");
+
+            SaveClanData();
+        }
+        private void setowner(PlayerSession Player, string[] args)
+        {
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan color <nazwa koloru>");
+                return;
+            }
+
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+            if (!ClanPlayer.IsOwner)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie jesteś Właścicielem klanu!");
+                return;
+            }
+            var Clan = GetClan(ClanPlayer.Clan);
+
+            foreach (var c in Clan.Users)
+            {
+                if (c.name.ToLower().Contains(args[1].ToLower()))
+                {
+                     Clan.Owner = c.steamid;
+                     GetPlayer(c.steamid).IsOwner = true;
+                     ClanPlayer.IsOwner = false;
+                     PlayerSession sess = GetPlayerSession(c.steamid);
+
+                     if (sess != null)
+                     hurt.SendChatMessage(sess, $"<color=green><size=18>CLAN</size></color> {Player.Name} przekazał tobie klan!");
+                     hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Przekazano klan do gracza {c.name}");
+ 
+                  return;
+                }
+            }
+
+            hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie znaleziono gracz sprecyzuj jego nazwe!");
+        }
+        private void setff(PlayerSession Player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan ff on/off");
+                return;
+            }
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+            var Clan = GetClan(ClanPlayer.Clan);
+            if (!ClanPlayer.IsOwner && !Clan.Capitan.Contains(ClanPlayer.steamid))
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie jesteś Właścicielem/Kapitanem klanu!");
+                return;
+            }
+
+            bool friendlyfire = Clan.FriendlyFire;
+
+            if (args[1].ToLower() == "off" || args[1].ToLower() == "of")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Friendly Fire wyłączony!");
+                friendlyfire = false;
+            }
+            if (args[1].ToLower() == "on")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Friendly Fire właczony!");
+                friendlyfire = true;
+            }
+            Clan.FriendlyFire = friendlyfire;
+            SaveClanData();
+        }
+        private void setauto(PlayerSession Player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan auto on/off");
+                return;
+            }
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+            var Clan = GetClan(ClanPlayer.Clan);
+            if (!ClanPlayer.IsOwner && !Clan.Capitan.Contains(ClanPlayer.steamid))
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie jesteś Właścicielem/Kapitanem klanu!");
+                return;
+            }
+
+            bool AutoTotems = Clan.FriendlyFire;
+
+            if (args[1].ToLower() == "off" || args[1].ToLower() == "of")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Automatyczne totemy wyłączone!");
+                AutoTotems = false;
+            }
+            if (args[1].ToLower() == "on")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Automatyczne totemy właczone!");
+                AutoTotems = true;
+            }
+            Clan.AutoTotems = AutoTotems;
+            SaveClanData();
+        }
+        private void capitan(PlayerSession Player, string[] args)
+        {
+            if (args.Length < 3)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan capitan add/remove <nazwa gracza>");
+                return;
+            }
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+
+            var Clan = GetClan(ClanPlayer.Clan);
+            foreach (var c in Clan.Users)
+            {
+                if (c.name.ToLower().Contains(args[2].ToLower()))
+                {
+                    if (args[1].ToLower() == "add")
+                    {
+                        if (!Clan.Capitan.Contains(c.steamid))
+                        {
+                            PlayerSession CapitanSession = GetPlayerSession(c.steamid);
+                            if (CapitanSession != null)
+                                hurt.SendChatMessage(CapitanSession, null, "<color=green><size=18>CLAN</size></color> Awansowano cie na kapitana clanu!");
+                            Clan.Capitan.Add(c.steamid);
+                            SaveClanData();
+                            hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Udało sie awansować na Kapitana gracza <color=#ffd1b3>{c.name}</color>");
+                        }
+                    }
+                    else if (args[1].ToLower() == "remove")
+                    {
+                        Clan.Capitan.Remove(c.steamid);
+                        SaveClanData();
+                        hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Zdegradowano gracza <color=#ffd1b3>{c.name}</color> z miejsca kapitana!");
+                    }
+                    else
+                    {
+                        hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan capitan add/remove <nazwa gracza>");
+                    }
+                    return;
+                }
+            }
+
+            hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie można znalezc gracza z takim nickiem sprecyzuj jego nazwe!");
+        }
+        private void createclan(PlayerSession Player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan create <nazwa klanu>");
+                return;
+            }
+            string ClanName = StripText(args[1]);
+
+            if (ClanName == null)
+                return;
+
+            if (!Regex.IsMatch(ClanName, @"^[\u0020-\u007E]*$"))
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nazwa klanu moze zawierac jedynie litery od A-Z oraz cyfry");
+                return;
+            }
+
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+
+            if (ClanName.Length > 5)
+            {
+                hurt.SendChatMessage(Player, null, "<color=#cc5200><size=18>CLAN</size></color> nie zostal stworzony maksymalna liczba znakow klanu to 5!");
+                return;
+            }
+            else if (ClansContains(ClanName))
+            {
+                hurt.SendChatMessage(Player, null, $"<color=#cc5200><size=18>CLAN</size></color> o nazwie <color=#ffd1b3>{ClanName}</color> już istnieje!");
+                return;
+            }
+            else
+            {
+
+                if (ClanPlayer != null)
+                {
+                    if (ClanPlayer.Clan != "")
+                    {
+                        hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> masz juz stworzony klan lub jesteś jego członkiem!");
+                        return;
+                    }
+                    else if (ClanPlayer.CreatTime != "")
+                    {
+                        var time = (DateTime.Parse(ClanPlayer.CreatTime).AddHours(6) - DateTime.Now);
+                        if (time.TotalHours > 1)
+                        {
+                            hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> mozesz zalozyc nastepny raz po {Convert.ToInt32(time.TotalHours)} godzinach!");
+                            return;
+                        }
+                        else
+                        {
+                            if (time.TotalMinutes > 1)
+                            {
+                                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> mozesz zalozyc nastepny raz za {Convert.ToInt32(time.TotalMinutes)} minut!");
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                var clan =  new Clan(ClanName, Player.SteamId.ToString(), new List<string>(), new List<ClanUser>(), new List<Application>(), new List<ClanTotem>(), null, "<color=#C0FEF7</color>", 1, false, false);
+                Clans.Add(clan);
+
+                var Clan = GetClan(ClanName);
+                Clan.Users.Add(new ClanUser(Player.Name, Player.SteamId.ToString()));
+          
+                ClanPlayer.Clan = ClanName;
+                ClanPlayer.CreatTime = DateTime.Now.ToString();
+                ClanPlayer.IsOwner = true;
+                SavePlayersData();
+                SaveClanData();
+                ChangeHeadOverName(Player, Clan);
+                ChangeName(Player, Clan);
+                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> <color=#ffd1b3>{ClanName}</color> został stworzony pomyślnie!");
+                return;
+            }
+        }
+        private void deleteclan(PlayerSession Player)
+        {
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+            if (!ClanPlayer.IsOwner)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie jesteś Właścicielem klanu!");
+                return;
+            }
+            var Clan = GetClan(ClanPlayer.Clan);
+
+            foreach (ClanUser user in Clan.Users)
+            {
+                PlayerSession session = GetPlayerSession(user.steamid);
+                ChangeHeadOverName(session);
+                ChangeName(session);
+                ClanPlayer.Clan = "";
+                ClanPlayer.IsOwner = false;
+            }
+            SavePlayersData();
+            hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Usunięto klan <color=#ffd1b3>{Clan.Name}</color>");
+
+            Clans.Remove(Clan);
+            SaveClanData();
+        }
+        private void exitclan(PlayerSession Player)
+        {
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+
+            var Clan = GetClan(ClanPlayer.Clan);
+
+            foreach (var c in Clan.Users)
+            {
+                if (Clan.Owner == Player.SteamId.ToString())
+                {
+                    hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan delete (Usuwanie calego klanu)");
+                    hurt.SendChatMessage(Player, null, $"<color=#3A758F><size=18>CLAN</size></color> /clan owner <nazwa gracza> - odanie klanu");
+                }
+                if (Clan.Owner == c.steamid)
+                    hurt.SendChatMessage(Player, null, $"<color=#3A758F><size=18>CLAN</size></color> Gracz {Player.Name} odszedł z klanu!");
+
+                if (c.steamid.Contains(Player.SteamId.ToString()))
+                {
+                    ChangeHeadOverName(Player);
+                    ChangeName(Player);
+                    hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Udalo sie opuścić klan {Clan.Name}");
+                    ClanPlayer.Clan = "";
+                }
+            }
+            SavePlayersData();
+            SaveClanData();
+
+        }
+        private void joinclan(PlayerSession Player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan join <nazwa klanu>");
+                return;
+            }
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+
+            if (ClanPlayer.Clan != "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Posiadasz juz klan <color=#ffd1b3>/clan exit</color>");
+                return;
+            }
+
+            var Clan = GetClan(args[1]);
+            if (Clan == null)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie znaleziono klanu o nazwie <color=#ffd1b3>{args[1]}</color>");
+                return;
+            }
+            if (Clan.Users.Count > 11)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> <color=#ffd1b3>{Clan.Name}</color> jest pełen!");
+                return;
+            }
+            foreach (var app in Clan.Applications)
+            {
+                if (app.steamid == Player.SteamId.ToString())
+                {
+                    hurt.SendChatMessage(Player, null, $"<color=#3A758F><size=18>CLAN</size></color> Wysłano już aplikacje o dołączenie do klanu <color=#ffd1b3>{Clan.Name}</color>");
+                    return;
+                }
+            }
+            Clan.Applications.Add(new Application(Player.Name, Player.SteamId.ToString(), DateTime.Now.ToString()));
+            SaveClanData();
+
+            hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Wysłano aplikacje o dołączenie do klanu <color=#ffd1b3>{Clan.Name}</color>");
+
+            PlayerSession ClanOwner = GetPlayerSession(Clan.Owner);
+
+            if (ClanOwner != null)
+            {
+                AlertManager.Instance.GenericTextNotificationServer("Clan Info\nUruchom Chat", ClanOwner.Player);
+                ClanOwner.IPlayer.Reply($"<color=green><size=18>CLAN</size></color> Gracz <color=#ffd1b3>{Player.Name}</color> Aplikuje do klanu!");
+            }
+            foreach (var c in Clan.Capitan)
+            {
+                PlayerSession ClanCapitan = GetPlayerSession(c);
+                AlertManager.Instance.GenericTextNotificationServer("Clan Info\nUruchom Chat", ClanCapitan.Player);
+                ClanCapitan.IPlayer.Reply($"<color=green><size=18>CLAN</size></color> Gracz <color=#ffd1b3>{ClanCapitan.Name}</color> Aplikuje do klanu!");
+            }
+
+        }
+        private void apply(PlayerSession Player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan apply <nazwa gracza>");
+                return;
+            }
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            var Clan = GetClan(ClanPlayer.Clan);
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+            else if (!ClanPlayer.IsOwner && !Clan.Capitan.Contains(ClanPlayer.steamid))
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz uprawnień do przyjmowania osób do klanu!");
+                return;
+            }
+
+            foreach (var c in Clan.Applications)
+            {
+               if (c.name.ToLower().Contains(args[1].ToLower()))
+               {
+                PlayerSession ClanJoinerSession = GetPlayerSession(c.steamid);
+
+                if (ClanJoinerSession != null)
+                {
+                    ClanJoinerSession.IPlayer.Reply($"<color=green><size=18>CLAN</size></color> Przyjęto cię do klanu <color=#ffd1b3>{Clan.Name}</color>");
+                    ChangeHeadOverName(ClanJoinerSession, Clan);
+                    ChangeName(ClanJoinerSession, Clan);
+                }
+                Clan.Users.Add(new ClanUser(c.name, c.steamid));
+                Clan.Applications.Remove(c);
+                var Joiner = GetPlayer(ClanJoinerSession.SteamId.ToString());
+                Joiner.Clan = Clan.Name;
+
+                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Przyjęto gracza <color=#ffd1b3>{c.name}</color> do klanu!");
+                SaveClanData();
+                SavePlayersData();
+
+                return;
+               }
+             }
+            hurt.SendChatMessage(Player, null, $"<color=#3A758F><size=18>CLAN</size></color> Gracz nie złożyl aplikacji lub nie sprecyzowano nazwy gracza!");
+
+        }
+        private void remove(PlayerSession Player, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Syntax error. /clan remove <nazwa gracza>");
+                return;
+            }
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+            if (ClanPlayer.Clan == "")
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+            else if (!ClanPlayer.IsOwner)
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz uprawnień do wyrzucania osób do klanu!");
+                return;
+            }
+
+            var Clan = GetClan(ClanPlayer.Clan);
+
+            foreach (ClanUser user in Clan.Users)
+            {
+              if (user.name.ToLower().Contains(args[1].ToLower()))
+              {
+
+                PlayerSession session = GetPlayerSession(user.steamid);
+                hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Usunięto gracza <color=#ffd1b3>{user.name}</color> z klanu!");
+                if (session != null)
+                {
+                    ChangeHeadOverName(session);
+                    ChangeName(session);
+                    session.IPlayer.Reply($"<color=#3A758F><size=18>CLAN</size></color> Usunięto cie z klanu {Clan.Name}");
+                }
+                Clan.Users.Remove(user);
+                var player = GetPlayer(user.steamid);
+                player.Clan = "";
+            SaveClanData();
+            SavePlayersData();
+                return;
+              }
+            }
+            hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie znaleziono gracza sprecyzuj jego nazwe!");
+
+        }
+        private void totem(PlayerSession Player)
+        {
+            var ClanPlayer = GetPlayer(Player.SteamId.ToString());
+
+            if (ClanPlayer.Clan == "")
+            {
+                    hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz klanu!");
+                return;
+            }
+
+            var Clan = GetClan(ClanPlayer.Clan);
+
+            var Position = Player.WorldPlayerEntity.transform.position;
+            OwnershipStakeServer ownershipStakeServer;
+            Dictionary<int, OwnershipStakeServer> ownershipCells = Singleton<ConstructionManager>.Instance.OwnershipCells;
+            ownershipCells.TryGetValue(ConstructionUtilities.GetOwnershipCell(Position), out ownershipStakeServer);
+
+            if (ownershipStakeServer.IsNullOrDestroyed())
+            {
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie znaleziono zadnego totemu!");
+                return;
+            }
+            if (!ownershipStakeServer.AuthorizedPlayers.Contains(Player.Identity))
+            {
+
+                hurt.SendChatMessage(Player, null, $"<color=red><size=18>CLAN</size></color> Nie posiadasz autoryzacji na tym kubiku!");
+                return;
+            }
+
+            ownershipStakeServer.TerritoryName = Clan.Name;
+
+            List<string> users = new List<string>();
+
+            foreach (var c in Clan.Users)
+            {
+                PlayerSession s = GetPlayerSession(c.steamid);
+                if (s != null)
+                    if (!ownershipStakeServer.AuthorizedPlayers.Contains(s.Identity))
+                        ownershipStakeServer.Authorize(s.Identity, ownershipStakeServer.GetComponent<GameObject>());
+            }
+            hurt.SendChatMessage(Player, null, $"<color=green><size=18>CLAN</size></color> Zautoryzowano wszystkich graczy z clanu!");
+        }
+
+        private void pomoc(PlayerSession Player)
+        {
+            hurt.SendChatMessage(Player, null, "<color=#3A758F><size=18>INFO</size></color> znajdziesz na <color=#ffd1b3>discord.gg/TFk8eUncgm</color> na kanale <color=#ffd1b3>#clany</color>");
+        }
+
+        #endregion
+
+        #region Utilitis
+
+        void ChangeName (PlayerSession session, Clan Clan = null)
+        {
+            if (session == null)
+                return;
+            if (Clan == null)
+                session.IPlayer.Name = $"<color={default_color}>{session.Name}</color>";
+            else
+                session.IPlayer.Name = $"[<color={Clan.Color}>{Clan.Name}</color>] <color={default_color}>{session.Name}</color> ";
+        }
+
+        void ChangeHeadOverName(PlayerSession session, Clan Clan = null)
+        {
+            if (session == null)
+                return;
+
+            if (Clan == null)
+            {
+                session.WorldPlayerEntity.GetComponent<HurtMonoBehavior>().RPC("UpdateName", uLink.RPCMode.OthersBuffered, "\r\n\r\n\r\n\r\n                                                                                                                                                                                                               " + "" + session.Name + "                                                                                                                                                                                                               \r\n\r\n\r\n\r\n");
+            }
+            else 
+            {
+                session.WorldPlayerEntity.GetComponent<HurtMonoBehavior>().RPC("UpdateName", uLink.RPCMode.OthersBuffered, "\r\n\r\n\r\n\r\n                                                                                                                                                                                                               " + "" +
+"<color=" + Clan.Color + ">" +
+Clan.Name + "</color> " + session.Name + "                                                                                                                                                                                                               \r\n\r\n\r\n\r\n");
+            }
+
+        }
+        Vector3 BlockedDn = new Vector3(-2038, 0, -3650);
+        Vector3 BlockedUp = new Vector3(-2224, 500, -3837);
+        private bool InBox(Vector3 pos1, Vector3 pos2, Vector3 pos) => (pos.x >= Mathf.Min(pos1.x, pos2.x)) && (pos.x <= Mathf.Max(pos1.x, pos2.x)) && (pos.y >= Mathf.Min(pos1.y, pos2.y)) && (pos.y <= Mathf.Max(pos1.y, pos2.y)) && (pos.z >= Mathf.Min(pos1.z, pos2.z)) && (pos.z <= Mathf.Max(pos1.z, pos2.z));
+        private bool IsFriend(PlayerSession player, PlayerSession torturer)
+        {
+            var Player = GetPlayer(player.SteamId.ToString());
+            var Torturer = GetPlayer(torturer.SteamId.ToString());
+
+            if (Player.Clan == "" || Torturer.Clan == "")
+                return false;
+
+            if (Player.Clan == Torturer.Clan && GetClan(Torturer.Clan).FriendlyFire)
+                return true;
+            else
+                return false;
+        }
+        private bool ClansContains(string ClanName)
+        {
+            for (int i = 0; i < Clans.Count; i++)
+            {
+                if (Clans[i].Name == ClanName)
+                    return true;
+            }
+            return false;
+        }
+        private string StripText(string text)
+        {
+
+            var stringReplacements = new string[]
+            {
+
+                "<b>", "</b>",
+                "<i>", "</i>",
+                "<x>",
+                ">", "<",
+                "</size>",
+                "</color>"
+            };
+
+            var regexReplacements = new Regex[]
+            {
+                new Regex(@"<color=.+?>"),
+                new Regex(@"<size=.+?>"),
+            };
+
+            foreach (var replacement in stringReplacements)
+                text = text.Replace(replacement, string.Empty);
+
+            foreach (var replacement in regexReplacements)
+                text = replacement.Replace(text, string.Empty);
+
+            return Formatter.ToPlaintext(Regex.Replace(text, @"\s+", " "));
+        }
+        private bool IsValidSession(PlayerSession session) => session != null && session?.SteamId != null && session.IsLoaded && session.Identity.Name != null && session.Identity != null &&session.WorldPlayerEntity?.transform?.position != null;
+        private PlayerSession GetPlayerSession(String source)
+        {
+            foreach (var session in GameManager.Instance.GetSessions())
+                if (IsValidSession(session.Value))
+                    if (session.Value.Identity.Name.ToLower().Contains(source.ToLower()) || session.Value.IPlayer.Address == source || session.Value.SteamId.ToString() == source)
+                        return session.Value;
+                        return null;
+        }
+                [ChatCommand("ip")]
+		void ips(PlayerSession session, string command, string[] args)
+		{
+                    session.IPlayer.Reply(GetPlayerSession(args[0]).IPlayer.Address);  
+                }
+
+        private Clan GetClan(string ClanName)
+        {
+            for (int i = 0; i < Clans.Count; i++)
+            {
+                if (Clans[i].Name == ClanName)
+                    return Clans[i];
+            }
+            return null;
+        }
+        private Player GetPlayer(string PlayerSteamid)
+        {
+            for (int i = 0; i < Players.Count; i++)
+            {
+                if (Players[i].steamid == PlayerSteamid)
+                    return Players[i];
+            }
+            return null;
+        }
+        public class Player
+        {
+            public string steamid { get; set; }
+            public string Clan { get; set; }
+            public bool IsOwner { get; set; }
+            public string CreatTime { get; set; }
+
+            public Player(string steamid, string Clan, bool IsOwner)
+            {
+                this.CreatTime = "";
+                this.steamid = steamid;
+                this.Clan = Clan;
+                this.IsOwner = IsOwner;
+            }
+        }
+        public class Clan
+        {   
+            public string Name { get; set; }
+            public string Owner { get; set; }
+            public List<string> Capitan { get; set; }
+            public List<ClanUser> Users { get; set; }
+            public List<Application> Applications { get; set; }
+            public List<ClanTotem> ClanTotem { get; set; }
+            public string Discord { get; set; }
+            public string Color { get; set; }
+            public string ColorTime { get; set; }
+            public int Level { get; set; }
+            public bool AutoTotems { get; set; }
+            public bool FriendlyFire { get; set; }
+
+            public Clan(string Name, string Owner, List<string> Capitan, List<ClanUser> Users, List<Application> Applications, List<ClanTotem> ClanTotem, string Discord, string Color, int Level, bool AutoTotems, bool FriendlyFire)
+            {
+                this.Name = Name;
+                this.Owner = Owner;
+                this.Capitan = Capitan;
+                this.Users = Users;
+                this.Applications = Applications;
+                this.ClanTotem = ClanTotem;
+                this.Color = Color;
+                this.ColorTime = "";
+                this.Level = Level;
+                this.AutoTotems = AutoTotems;
+                this.FriendlyFire = FriendlyFire;
+            }
+        }
+        public class ClanTotem
+        {
+            public string Position { get; set; }
+            public List<string> Users { get; set; }
+
+
+            public ClanTotem(string Position, List<string> Users)
+            {
+                this.Position = Position;
+                this.Position = Position;
+            }
+        }
+        public class ClanUser
+        {
+            public string name { get; set; }
+            public string steamid { get; set; }
+
+
+            public ClanUser(string name, string steamid)
+            {
+                this.name = name;
+                this.steamid = steamid;
+            }
+        }
+        public class Application
+        {
+            public string name { get; set; }
+            public string steamid { get; set; }
+            public string data { get; set; }
+
+            public Application(string name, string steamid, string data)
+            {
+                this.name = name;
+                this.steamid = steamid;
+                this.data = data;
+            }
+        }
+        #endregion
+
+    }
+}
